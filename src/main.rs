@@ -101,8 +101,8 @@ pub fn log(msg: String) {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let cert_path = Path::new("./cert.file");
-    let key_path = Path::new("./pem.file");
+    let cert_path = Path::new("./ssl/server.crt");
+    let key_path = Path::new("./ssl/server.key");
     let keys = Arc::new(Vec::<[u8; 32]>::new());
     start_api(cert_path, key_path, "127.0.0.1:443", keys).await;
     Ok(())
