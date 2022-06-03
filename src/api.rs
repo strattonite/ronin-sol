@@ -1,3 +1,4 @@
+use base64::decode;
 use ed25519_dalek::{PublicKey, Signature};
 use futures_util::stream::StreamExt;
 use rustls_pemfile::{certs, rsa_private_keys};
@@ -5,7 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::{
     convert::TryInto,
     fs::File,
-    io::{self, BufReader},
+    io::{self, BufRead, BufReader},
     path::Path,
     sync::Arc,
 };
@@ -45,9 +46,10 @@ fn load_certs(path: &Path) -> io::Result<Vec<Certificate>> {
 }
 
 fn load_keys(path: &Path) -> io::Result<Vec<PrivateKey>> {
-    rsa_private_keys(&mut BufReader::new(File::open(path)?))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))
-        .map(|mut keys| keys.drain(..).map(PrivateKey).collect())
+    let reader = BufReader::new(File::open(path)?);
+    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+    let der = decode(lines[1..lines.len() - 1].join("")).unwrap();
+    Ok(vec![PrivateKey(der)])
 }
 
 pub async fn start_api(
