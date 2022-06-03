@@ -104,7 +104,7 @@ async fn main() -> std::io::Result<()> {
     let cert_path = Path::new("./ssl/server.crt");
     let key_path = Path::new("./ssl/server.key");
     let keys = Arc::new(Vec::<[u8; 32]>::new());
-    start_api(cert_path, key_path, "127.0.0.1:443", keys).await;
+    start_api(cert_path, key_path, "45.143.147.119:443", keys).await;
     Ok(())
     // let candy_id = String::from("GFxvJ8p2LLXWsZELbPEmTFENrjfmywDpAzvK9nn7VC1w");
     // let rpc = RpcClient::new("https://api.devnet.solana.com");
