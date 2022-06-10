@@ -16,7 +16,9 @@ use tokio_tungstenite::accept_async;
 pub mod api;
 pub mod cmv2;
 pub mod state;
+pub mod tpu_client;
 pub mod wallet;
+pub mod ws_json;
 
 use api::*;
 use cmv2::*;
@@ -101,11 +103,22 @@ pub fn log(msg: String) {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let cert_path = Path::new("./ssl/server.crt");
-    let key_path = Path::new("./ssl/server.key");
-    let keys = Arc::new(Vec::<[u8; 32]>::new());
-    start_api(cert_path, key_path, "45.143.147.119:443", keys).await;
+    // let cert_path = Path::new("./ssl/server.crt");
+    // let key_path = Path::new("./ssl/server.key");
+    // let keys = Arc::new(Vec::new());
+    // start_api(cert_path, key_path, "45.143.147.119:443", keys).await;
+    // Ok(())
+
+    let v = vec![ws_json::Subscription::PROGRAM(
+        10,
+        "hello world".to_string(),
+    )];
+    let el = ws_json::Subscription::PROGRAM(10, "hello".to_string());
+
+    println!("{}", matches!(v.get(0).unwrap(), el));
+
     Ok(())
+
     // let candy_id = String::from("GFxvJ8p2LLXWsZELbPEmTFENrjfmywDpAzvK9nn7VC1w");
     // let rpc = RpcClient::new("https://api.devnet.solana.com");
 
