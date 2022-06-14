@@ -1,11 +1,19 @@
 use crate::ws_json::*;
 use bincode::serialize;
-use bs58::decode;
-use futures::future::join_all;
-use futures_util::{SinkExt, StreamExt};
+use bs58::{decode, encode};
+use crossbeam_channel;
+use futures::{
+    future::{self, join_all, FutureExt, RemoteHandle},
+    task::Context,
+};
+use futures_util::{stream, task::Poll, SinkExt, StreamExt};
 use serde_json::from_str;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction};
+use solana_sdk::{
+    hash::Hash,
+    pubkey::Pubkey,
+    transaction::{Transaction, TransactionError},
+};
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -30,16 +38,13 @@ use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 // TODO:
-// handle subscription request queue
-//  create controller abstraction
-//   check for TX's on every loop (not just slot)
-//    send gracefull shutdown ready on tx channel
+// create client
+// error handling in start function
+// refactor start into struct?
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Error, Clone)]
 pub enum TxError {
-    #[error("no leaders cached for slot {0}")]
-    LEADER_SCHEDULE_OVERFLOW(u64),
     #[error("UDP error: {0}")]
     UDP_ERROR(String),
     #[error("Error updating leaders: {0}")]
@@ -72,9 +77,8 @@ pub enum Incoming {
 pub enum Outgoing {
     NOTIF(Notification),
     SUBSCRIBED(Subscription),
-    ERROR(TxError),
     TX(TxResult),
-    STOPPED,
+    ERROR(TxError),
 }
 
 #[derive(Debug, Clone)]
@@ -100,8 +104,9 @@ type Nodes = HashMap<Pubkey, SocketAddr>;
 type Leaders = HashMap<u64, SocketAddr>;
 type Websocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type TxResult = ([u8; 32], Result<(), TxError>);
+type RxStream = futures_util::stream::PollFn<dyn FnMut(&mut Context) -> Poll<Option<Outgoing>>>;
 
-async fn connect_websocket(url: &str) -> Websocket {
+async fn connect_websocket(url: &str) -> Result<Websocket, TxError> {
     let mut root = RootCertStore::empty();
     root.add_server_trust_anchors(TLS_SERVER_ROOTS.0.iter().map(|ta| {
         OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -119,9 +124,9 @@ async fn connect_websocket(url: &str) -> Websocket {
     let (socket, _) =
         connect_async_tls_with_config(Url::parse(url).unwrap(), None, Some(connector))
             .await
-            .unwrap();
+            .map_err(|e| WEBSOCKET_ERR(format!("could not connect to websocket: {:?}", e)))?;
 
-    socket
+    Ok(socket)
 }
 
 async fn get_node_map(rpc: &RpcClient) -> Result<Nodes, TxError> {
@@ -161,213 +166,240 @@ async fn get_schedule(
     Ok((map, slot + leaders.len() as u64))
 }
 
+// signature subscription yields future?
+// use remote_handle for signature subscriptions
+// use async channel for account and program subscriptions e.g pub fn subscribe(id) -> Receiver
+
 pub struct TpuClient {
-    handle: JoinHandle<Result<(), TxError>>,
-    tx: Sender<Incoming>,
-    rx: Receiver<Outgoing>,
-    tx_o: Sender<Outgoing>,
+    handle: JoinHandle<()>,
+    tx: crossbeam_channel::Sender<Incoming>,
+    rx: crossbeam_channel::Receiver<Outgoing>,
 }
 
 impl TpuClient {
-    pub fn new(socket: &'static str, ws_url: &'static str, rpc_url: &str) -> Self {
+    pub async fn new(rpc_url: &str, socket: &str, ws_url: &str) -> Result<Self, TxError> {
+        let (tx_o, rx_o) = crossbeam_channel::unbounded();
+        let (tx_i, rx_i) = crossbeam_channel::unbounded();
+
+        let websocket = connect_websocket(ws_url).await?;
+        let udp = Arc::new(
+            UdpSocket::bind(socket)
+                .await
+                .map_err(|e| UDP_ERROR(e.to_string()))?,
+        );
+
         let rpc = RpcClient::new(rpc_url.to_string());
-        let (tx_o, rx_o) = channel(100);
-        let (tx_i, rx_i) = channel(100);
-
         let tx2 = tx_o.clone();
-        let handle = tokio::spawn(async move { start(rpc, socket, ws_url, tx2, rx_i).await });
+        let handle = tokio::spawn(async move {
+            let res = start(rpc, udp, websocket, tx_o, rx_i).await;
+            if let Err(e) = res {
+                tx2.send(ERROR(e)).unwrap();
+            }
+        });
 
-        TpuClient {
+        Ok(TpuClient {
             handle,
             tx: tx_i,
             rx: rx_o,
-            tx_o,
-        }
+        })
     }
 
-    pub async fn submit_txs(
-        &mut self,
-        txs: Vec<Transaction>,
-        slot: Option<u64>,
-    ) -> Result<Vec<Hash>, TxError> {
-        let hashes = txs
-            .iter()
-            .map(|tx| tx.verify_and_hash_message().unwrap())
-            .collect();
-        let t = txs
-            .iter()
-            .map(|tx| {
-                (
-                    serialize(tx).unwrap(),
-                    tx.verify_and_hash_message().unwrap().to_bytes(),
-                )
-            })
-            .collect();
+    // pub fn confirm_tx(&self, hash: Hash) -> RemoteHandle<Result<(), TransactionError>> {
+    //     let rx2 = self.rx.clone();
+    //     self.tx
+    //         .send(SUBS(ManageSubs::SUBSCRIBE(SubRequest::SIGNATURE(
+    //             encode(hash.to_bytes()).into_string(),
+    //         ))))
+    //         .unwrap();
+    //     let f = future::poll_fn(|_| match rx2.try_recv() {
+    //         Ok(o) => Poll::Pending,
+    //         Err(_) => Poll::Pending,
+    //     });
+    // }
 
-        self.tx.send(TXS(t, slot)).unwrap();
+    pub fn send_txs(txs: Vec<Transaction>) {}
+}
 
-        Ok(hashes)
-    }
+enum StreamRes {
+    WS(Notification),
+    CLIENT(Incoming),
+}
+
+use StreamRes::*;
+
+async fn send_txs(
+    udp: Arc<UdpSocket>,
+    txs: Vec<(Vec<u8>, [u8; 32])>,
+    leader: SocketAddr,
+) -> Vec<TxResult> {
+    join_all(txs.iter().map(|(tx, hash)| async {
+        let l = tx.len();
+        (
+            *hash,
+            udp.send_to(tx, leader)
+                .await
+                .or_else(|x| Err(UDP_ERROR(x.to_string())))
+                .and_then(|x| {
+                    if x == l {
+                        Ok(())
+                    } else {
+                        Err(UDP_ERROR(format!("only {} of {} bytes sent", x, l)))
+                    }
+                }),
+        )
+    }))
+    .await
 }
 
 async fn start(
     rpc: RpcClient,
-    socket: &str,
-    ws_url: &str,
-    tx: Sender<Outgoing>,
-    mut rx: Receiver<Incoming>,
+    udp: Arc<UdpSocket>,
+    websocket: Websocket,
+    tx: crossbeam_channel::Sender<Outgoing>,
+    rx: crossbeam_channel::Receiver<Incoming>,
 ) -> Result<(), TxError> {
-    let mut pubsub = connect_websocket(ws_url).await;
-    let udp = Arc::new(UdpSocket::bind(socket).await.unwrap());
-    let _s = rpc.get_slot().await.map_err(|e| RPC_ERR(e.to_string()))?;
-    let slot = Arc::new(Mutex::new(_s));
+    let mut slot = rpc.get_slot().await.map_err(|e| RPC_ERR(e.to_string()))?;
     let nodes = get_node_map(&rpc).await?;
-    let (mut leaders, mut max_slot) = get_schedule(&rpc, &nodes, _s).await?;
+    let (mut leaders, mut max_slot) = get_schedule(&rpc, &nodes, slot).await?;
 
-    let subscriptions = Arc::new(Mutex::new(Vec::<Subscription>::new()));
-    let tx_schedule = Arc::new(Mutex::new(HashMap::<u64, Vec<(Vec<u8>, [u8; 32])>>::new()));
-    let sub_reqs = Arc::new(Mutex::new(VecDeque::<ManageSubs>::new()));
-    let stopping = Arc::new(Mutex::new(false));
+    let mut subscriptions = Vec::<Subscription>::new();
+    let mut tx_schedule = HashMap::<u64, Vec<(Vec<u8>, [u8; 32])>>::new();
+    let mut sub_reqs = VecDeque::<ManageSubs>::new();
     let mut current_req = None::<ManageSubs>;
+    let mut stopping = false;
 
-    let t = tx_schedule.clone();
-    let r = sub_reqs.clone();
-    let s = subscriptions.clone();
-    let st = stopping.clone();
-    let slt = slot.clone();
+    let client_stream = stream::poll_fn(|_| {
+        return match rx.try_recv() {
+            Ok(i) => Poll::Ready(Some(Ok(CLIENT(i)))),
+            Err(_) => Poll::Pending,
+        };
+    });
 
-    let handle = tokio::spawn(async move {
-        while let Ok(i) = rx.recv().await {
-            match i {
-                TXS(mut txs, s) => {
-                    let mut tx_s = t.lock().unwrap();
-                    let sl = match s {
-                        Some(n) => n,
-                        None => *slt.lock().unwrap() + 1,
-                    };
-                    if let Some(v) = tx_s.get_mut(&sl) {
-                        v.append(&mut txs);
-                    } else {
-                        tx_s.insert(sl, txs);
-                    }
-                }
-                STOP => {
-                    let mut reqs = r.lock().unwrap();
-                    let mut schedule = t.lock().unwrap();
-                    reqs.clear();
-                    schedule.clear();
-                    for sub in s.lock().unwrap().iter() {
-                        reqs.push_back(ManageSubs::UNSUBSCRIBE(sub.clone()))
-                    }
-                    *st.lock().unwrap() = true;
-                    break;
-                }
-                SUBS(m) => {
-                    let mut reqs = r.lock().unwrap();
-                    reqs.push_back(m);
-                }
-            }
+    let (mut ps, ws) = websocket.split();
+    let ws_stream = ws.map(|m| {
+        Ok(WS(
+            Notification::from_msg(&m.unwrap()).map_err(|e| WEBSOCKET_ERR(e.to_string()))?
+        ))
+    });
+    let (ps_tx, mut ps_rx) = unbounded_channel::<String>();
+
+    let ps_handle = tokio::spawn(async move {
+        while let Some(m) = ps_rx.recv().await {
+            ps.send(Message::Text(m)).await.unwrap();
         }
     });
 
-    while let Some(ws_msg) = pubsub.next().await {
-        let msg = Notification::from_msg(
-            &ws_msg.map_err(|e| WEBSOCKET_ERR(format!("error reading from websocket: {:?}", e)))?,
-        )
-        .map_err(|e| WEBSOCKET_ERR(format!("could not deserialize websocket message: {:?}", e)))?;
+    let mut joint_stream = stream::select(client_stream, ws_stream);
 
-        match &msg {
-            SLOT(sn) => {
-                let _s = {
-                    let mut s = slot.lock().unwrap();
-                    *s = sn.params.result.slot;
-                    *s
-                };
-                if _s >= max_slot - 1 {
-                    (leaders, max_slot) = get_schedule(&rpc, &nodes, _s).await?;
-                }
+    let submit_txs = |txs, s, lds: &Leaders| -> Result<(), TxError> {
+        let u = udp.clone();
+        let l = *lds.get(&s).ok_or(NO_LEADER_FOUND(s))?;
+        let _tx = tx.clone();
+        tokio::spawn(async move {
+            let mut res = send_txs(u, txs, l).await;
+            for r in res.drain(..) {
+                _tx.send(TX(r)).unwrap();
             }
-            SUBSCRIPTION(sub) => {
-                if let Some(ManageSubs::SUBSCRIBE(sr)) = current_req {
-                    let sub = match sr {
-                        SubRequest::SLOT => Subscription::SLOT(sub.id),
-                        SubRequest::PROGRAM(p) => Subscription::PROGRAM(sub.id, p),
-                        SubRequest::ACCOUNT(p) => Subscription::ACCOUNT(sub.id, p),
-                        SubRequest::SIGNATURE(p) => Subscription::SIGNATURE(sub.id, p),
-                    };
-                    subscriptions.lock().unwrap().push(sub.clone());
-                    tx.send(SUBSCRIBED(sub)).unwrap();
-                    current_req = None;
+        });
+        Ok(())
+    };
+
+    while let Some(i) = joint_stream.next().await {
+        match i? {
+            CLIENT(incoming) => match incoming {
+                TXS(mut txs, slt) => match slt {
+                    Some(n) => {
+                        if let Some(v) = tx_schedule.get_mut(&n) {
+                            v.append(&mut txs);
+                        } else {
+                            tx_schedule.insert(n, txs);
+                        }
+                    }
+                    None => {
+                        submit_txs(txs, slot, &leaders)?;
+                    }
+                },
+                STOP => {
+                    sub_reqs.clear();
+                    tx_schedule.clear();
+                    for sub in subscriptions.drain(..) {
+                        sub_reqs.push_back(ManageSubs::UNSUBSCRIBE(sub))
+                    }
+                    stopping = true;
                 }
-            }
-            UNSUBSCRIBED(_) => {
-                if let Some(ManageSubs::UNSUBSCRIBE(us)) = current_req {
-                    let mut subs = subscriptions.lock().unwrap();
-                    for (i, s) in subs.iter().enumerate() {
-                        if s.id() == us.id() {
-                            subs.remove(i);
+                SUBS(req) => match current_req {
+                    Some(_) => {
+                        sub_reqs.push_back(req);
+                    }
+                    None => {
+                        ps_tx.send(req.to_json()).unwrap();
+                        current_req = Some(req);
+                    }
+                },
+            },
+            WS(notification) => match &notification {
+                SLOT(sn) => {
+                    slot = sn.params.result.slot;
+                    if slot >= max_slot {
+                        (leaders, max_slot) = get_schedule(&rpc, &nodes, slot).await?;
+                    }
+                    if let Some(txs) = tx_schedule.remove(&slot) {
+                        submit_txs(txs, slot, &leaders)?;
+                    }
+                }
+                SUBSCRIPTION(sr) => {
+                    if let Some(ManageSubs::SUBSCRIBE(req)) = current_req {
+                        let sub = match req {
+                            SubRequest::SLOT => Subscription::SLOT(sr.id),
+                            SubRequest::PROGRAM(p) => Subscription::PROGRAM(sr.id, p),
+                            SubRequest::ACCOUNT(p) => Subscription::ACCOUNT(sr.id, p),
+                            SubRequest::SIGNATURE(p) => Subscription::SIGNATURE(sr.id, p),
+                        };
+                        subscriptions.push(sub.clone());
+                        tx.send(SUBSCRIBED(sub)).unwrap();
+
+                        if let Some(req) = sub_reqs.pop_front() {
+                            ps_tx.send(req.to_json()).unwrap();
+                            current_req = Some(req);
+                        } else {
+                            current_req = None;
+                        }
+                    }
+                }
+                UNSUBSCRIBED(_) => {
+                    if let Some(ManageSubs::UNSUBSCRIBE(us)) = current_req {
+                        for (i, s) in subscriptions.iter().enumerate() {
+                            if s.id() == us.id() {
+                                subscriptions.remove(i);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(req) = sub_reqs.pop_front() {
+                        ps_tx.send(req.to_json()).unwrap();
+                        current_req = Some(req);
+                    } else {
+                        current_req = None;
+                        if subscriptions.len() == 0 && stopping {
+                            ps_handle.abort();
                             break;
                         }
                     }
-                    current_req = None;
                 }
-            }
-            _ => {
-                tx.send(NOTIF(msg)).unwrap();
-            }
-        }
-
-        {
-            let (tx_o, leader) = {
-                let s = slot.lock().unwrap();
-                match tx_schedule.lock().unwrap().remove(&s) {
-                    Some(ts) => (
-                        Some(ts),
-                        Some(leaders.get(&s).expect("could not get leader for slot")),
-                    ),
-                    None => (None, None),
+                SIGNATURE(sig) => {
+                    for (i, s) in subscriptions.iter().enumerate() {
+                        if s.id() == sig.params.subscription {
+                            subscriptions.remove(i);
+                            break;
+                        }
+                    }
+                    tx.send(NOTIF(notification)).unwrap();
                 }
-            };
-            if let Some(txs) = tx_o {
-                join_all(txs.iter().map(|(_tx, hash)| async {
-                    let l = _tx.len();
-                    let res = (
-                        *hash,
-                        udp.send_to(_tx, *leader.unwrap())
-                            .await
-                            .or_else(|x| Err(UDP_ERROR(x.to_string())))
-                            .and_then(|x| {
-                                if x == l {
-                                    Ok(())
-                                } else {
-                                    Err(UDP_ERROR(format!("only {} of {} bytes sent", x, l)))
-                                }
-                            }),
-                    );
-                    tx.send(TX(res)).unwrap();
-                }))
-                .await;
-            }
-        }
-
-        match current_req {
-            Some(_) => {}
-            None => {
-                let p = sub_reqs.lock().unwrap().pop_front();
-                if let Some(r) = p {
-                    pubsub
-                        .send(Message::Text(r.to_json()))
-                        .await
-                        .map_err(|e| WEBSOCKET_ERR(format!("error sending request: {:?}", e)))?;
-                    current_req = Some(r);
-                } else if *stopping.lock().unwrap() {
-                    tx.send(STOPPED).unwrap();
-                    break;
+                _ => {
+                    tx.send(NOTIF(notification)).unwrap();
                 }
-            }
+            },
         }
     }
-
-    handle.abort();
     Ok(())
 }
